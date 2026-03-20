@@ -7,13 +7,9 @@
 #   sudo ./setup_macos_pf.sh disable
 #
 # Defaults: PROXY_PORT=8080  TARGET_PORT=80
-#
-# What this does:
-#   1. Saves your existing pf.conf as a backup.
-#   2. Adds a rdr-to rule that redirects TCP on TARGET_PORT to the proxy.
-#   3. Enables pf.
-#
 # To test: curl -v http://httpbin.org/get  (with proxy running on PROXY_PORT)
+# To edit just this pf rules: edit the isolated anchor file and run
+# sudo pfctl -a tcp_proxy -f /etc/pf.anchors/tcp_proxy
 # =============================================================================
 
 set -euo pipefail
@@ -40,9 +36,6 @@ enable_pf() {
     # Write anchor rules
     cat > "${ANCHOR_FILE}" <<EOF
 # tcp_proxy anchor — redirect TARGET_PORT → PROXY_PORT on loopback
-#
-# rdr-to on lo0: intercept connections on the loopback interface.
-# For traffic from other machines, replace lo0 with your interface (e.g. en0).
 rdr pass on lo0 proto tcp from any to any port ${TARGET_PORT} -> 127.0.0.1 port ${PROXY_PORT}
 EOF
 
@@ -52,24 +45,39 @@ EOF
         echo "→ Backed up pf.conf to ${PF_CONF}.tcp_proxy_backup"
     fi
 
-    # Add anchor reference to pf.conf if not already there
-    if ! grep -q "tcp_proxy" "${PF_CONF}"; then
-        cat >> "${PF_CONF}" <<EOF
-
-# Added by setup_macos_pf.sh
-rdr-anchor "${PF_ANCHOR}"
-anchor "${PF_ANCHOR}"
-load anchor "${PF_ANCHOR}" from "${ANCHOR_FILE}"
-EOF
-        echo "→ Added anchor reference to ${PF_CONF}"
+    # Safely inject the rules in the exact required order using awk
+    if ! grep -q "${PF_ANCHOR}" "${PF_CONF}"; then
+        echo "→ Injecting anchor references into ${PF_CONF} in the correct order..."
+        
+        awk -v anchor="${PF_ANCHOR}" -v anchor_file="${ANCHOR_FILE}" '
+        { print }
+        $0 == "rdr-anchor \"com.apple/*\"" {
+            print "rdr-anchor \"" anchor "\""
+        }
+        $0 == "anchor \"com.apple/*\"" {
+            print "anchor \"" anchor "\""
+        }
+        $0 == "load anchor \"com.apple\" from \"/etc/pf.anchors/com.apple\"" {
+            print "load anchor \"" anchor "\" from \"" anchor_file "\""
+        }' "${PF_CONF}.tcp_proxy_backup" > "${PF_CONF}.tmp"
+        
+        mv "${PF_CONF}.tmp" "${PF_CONF}"
+        echo "→ Successfully updated ${PF_CONF}"
     fi
 
-    # Enable pf and load rules
-    pfctl -e 2>/dev/null || true          # enable (ignore if already enabled)
-    pfctl -f "${PF_CONF}"                  # reload full ruleset
+    # Enable pf
+    pfctl -e 2>/dev/null || true
+    
+    # Reload full ruleset and catch syntax errors safely
+    echo "→ Loading pf rules..."
+    if ! pfctl -f "${PF_CONF}"; then
+        echo "❌ Syntax error detected! Restoring backup pf.conf to prevent network lockout..."
+        cp "${PF_CONF}.tcp_proxy_backup" "${PF_CONF}"
+        exit 1
+    fi
 
     echo ""
-    echo "✅  pf is now active. Rules:"
+    echo "✅  pf is now active. Rules in memory:"
     pfctl -s nat 2>/dev/null | grep -i "${PF_ANCHOR}" || pfctl -a "${PF_ANCHOR}" -s nat 2>/dev/null || true
 
     echo ""
@@ -95,11 +103,8 @@ disable_pf() {
     # Remove anchor file
     rm -f "${ANCHOR_FILE}"
 
-    # Reload pf (will flush our anchor)
+    # Reload pf (will flush our anchor safely)
     pfctl -f "${PF_CONF}" 2>/dev/null || true
-
-    # Optionally disable pf entirely (commented out — other apps may use it)
-    # pfctl -d
 
     echo "✅  pf tcp_proxy rules removed."
 }
