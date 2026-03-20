@@ -7,7 +7,7 @@
 #   sudo ./setup_macos_pf.sh disable
 #
 # Defaults: PROXY_PORT=8080  TARGET_PORT=80
-# To test: curl -v http://httpbin.org/get  (with proxy running on PROXY_PORT)
+# To test: curl -v http://httpbin.org/get   (with proxy running on PROXY_PORT)
 # To edit just this pf rules: edit the isolated anchor file and run
 # sudo pfctl -a tcp_proxy -f /etc/pf.anchors/tcp_proxy
 # =============================================================================
@@ -34,9 +34,20 @@ enable_pf() {
     mkdir -p /etc/pf.anchors
 
     # Write anchor rules
+    # Detect default outbound interface
+    DEFAULT_IF=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+    if [[ -z "${DEFAULT_IF}" ]]; then
+        echo "⚠️  Could not detect default interface, falling back to en0"
+        DEFAULT_IF="en0"
+    fi
+    echo "  INTERFACE  : ${DEFAULT_IF}"
+
     cat > "${ANCHOR_FILE}" <<EOF
-# tcp_proxy anchor — redirect TARGET_PORT → PROXY_PORT on loopback
+# tcp_proxy anchor — transparent redirect TARGET_PORT → PROXY_PORT
+# catch packets on loopback and redirect to proxy
 rdr pass on lo0 proto tcp from any to any port ${TARGET_PORT} -> 127.0.0.1 port ${PROXY_PORT}
+# reroute outbound packets on the real interface (like en0) to loopback so the rdr rule catches them
+pass out on ${DEFAULT_IF} route-to lo0 proto tcp from any to any port ${TARGET_PORT} no state
 EOF
 
     # Backup pf.conf if not already backed up
